@@ -9,9 +9,11 @@ const axios = require('axios');
 require('dotenv').config();
 require('axios').default;
 
-setInterval(initializeSchedule, 2000);
+setInterval(initializeSchedule, 3000);
 
-setInterval(startSchedule, 2000);
+setInterval(startSchedule, 4000);
+
+setInterval(stopSchedule, 5000);
 
 async function initializeSchedule() {
     // console.log('Starting batch.log');
@@ -46,15 +48,17 @@ async function initializeSchedule() {
                 } else if (row.ScheduleType == 'A') {
                     let fromDate = new Date(row.ScheduleFromDate);
                     let toDate = new Date();
-                    let formattedFromDate = format(fromDate);
-                    let formattedToDate = format(toDate);
-                    if (formattedFromDate != formattedToDate) {
-                        executionStatus = 'SKIP';
+                    let formattedFromDate = sqlDateFormat(fromDate);
+                    let formattedToDate = sqlDateFormat(toDate);
+                    if (formattedFromDate == formattedToDate) {
+                        executionStatus = 'START';
+                        await sql.connect(config.sqlConfig);
                         sql.query(`Update FarmerBlockSchedule Set ScheduleActiveYN = 0, DeleteYN = 1 Where ID = ${row.ID}`);
                     }
                 }
-                const insertSQL = `INSERT INTO IrrigationScheduleTempTable (ScheduleID, ExecutionStartTime, ExecutionStatus, ExecutionDate ) Values (${row.ID}, GetDate(), '${executionStatus}', cast(GetDate() as Date))`;
-
+                const insertSQL = `INSERT INTO IrrigationScheduleTempTable (ScheduleID, ExecutionStartTime, ExecutionStatus, ExecutionDate, Target, TargetType, FarmerBlockLinkedIDs ) Values (${row.ID}, GetDate(), '${executionStatus}', cast (GetDate() as Date), ${row.ScheduleIrrigationValue}, '${row.ScheduleIrrigationType}', '${row.FarmerBlockLinkedIDs}')`;
+                //console.log(insertSQL);
+                await sql.connect(config.sqlConfig);
                 let insertResult = await sql.query(insertSQL);
                 //console.dir(insertResult);
             });
@@ -67,162 +71,232 @@ async function initializeSchedule() {
 }
 
 async function startSchedule() {
-    const selectSQL = `SELECT b.ID TempTableID, * FROM FarmerBlockSchedule a join IrrigationScheduleTempTable b on a.ID = b.ScheduleID  WHERE ExecutionStatus = 'START' AND cast(ExecutionDate as Date) = cast(getDate() as Date)`;
+    const selectSQL = `SELECT ID TempTableID, * FROM IrrigationScheduleTempTable WHERE ExecutionStatus = 'START' AND cast(ExecutionDate as Date) = cast(getDate() as Date)`;
     await sql.connect(config.sqlConfig);
     let result = await sql.query(selectSQL);
-    console.dir(result);
+    //console.dir(result);
     if (result.recordset.length > 0) {
         result.recordset.map(async (row) => {
-            let deviceList = await getDeviceList(row.FarmerBlockLinkedIDs);
-
-            if (row.ScheduleIrrigationType == 'V') {
-                startStopScheduleVolume(row, deviceList);
-            } else {
-                startStopScheduleTimer(row, deviceList);
-            }
-            const updateSQL = `Update IrrigationScheduleTempTable set ExecutionStatus =  'INPROGRESS'  where ID = ${row.TempTableID}`;
-            console.log(updateSQL);
-            await sql.query(updateSQL);
+            let deviceList = await getDeviceList(row.FarmerBlockLinkedIDs, false);
+            console.log("row.FarmerBlockLinkedIDs", row.FarmerBlockLinkedIDs);
+            if (deviceList == '') return;
+            const resultDownlink = await executeDownlink(deviceList, true);
+            let executionStatus = 'ERROR'
+            if (resultDownlink) executionStatus = 'INPROGRESS';
+            const updateSQL = `Update IrrigationScheduleTempTable set ExecutionStatus =  '${executionStatus}'  where ID = ${row.TempTableID}`;
+            //    console.log(updateSQL);
+            let updateResult = await sql.query(updateSQL);
         });
     }
 }
 
-async function startStopScheduleVolume(row, deviceList) {
-    const volumeTarget = row.ScheduleIrrigationValue;
-    executeDownlink(deviceList, true);
-
-    // let timerObject = timer.periodic(async () => {
-    //     let currentWaterflow = await getWaterflowData(deviceList);
-    //     if (currentWaterflow > volumeTarget) {
-    //         executeDownlink(false);
-    //         clearTimeout(timerObject);
-    //         const updateSQL = `Update IrrigationScheduleTempTable set ExecutionStatus =  'DONE'  where ID = ${row.TempTableID}`;
-    //         console.log(updateSQL);
-    //         await sql.query(updateSQL);
-    //     }
-    // });
+async function stopSchedule() {
+    const selectSQL = `SELECT  * FROM  IrrigationScheduleTempTable WHERE ExecutionStatus = 'INPROGRESS' AND cast(ExecutionDate as Date) = cast(getDate() as Date)`;
+    //console.log(selectSQL);
+    await sql.connect(config.sqlConfig);
+    let result = await sql.query(selectSQL);
+    //console.dir(result);
+    if (result.recordset.length > 0) {
+        for (let i = 0; i < result.recordset.length; i++) {
+            console.log("row");
+            //console.dir(row);
+            let sqlDeviceList = await getDeviceList(result.recordset[i].FarmerBlockLinkedIDs, true);
+            let completed = await checkCompletion(result.recordset[i], sqlDeviceList);
+            if (completed) {
+                let deviceList = await getDeviceList(result.recordset[i].FarmerBlockLinkedIDs, false);
+                const resultDownlink = await executeDownlink(deviceList, false);
+                console.log('complete downlinkURL', resultDownlink);
+                let executionStatus = 'ERROR'
+                if (resultDownlink) executionStatus = 'DONE';
+                const updateSQL = `Update IrrigationScheduleTempTable set ExecutionStatus = '${executionStatus}'  where ID = ${result.recordset[i].ID}`;
+                console.log(updateSQL);
+                await sql.query(updateSQL);
+            }
+        }
+    }
 }
 
-async function startStopScheduleTimer(row, deviceList) {
-    const timerTarget = row.ScheduleIrrigationValue;
-    executeDownlink(deviceList, true);
-    setTimeout(async () => {
-        executeDownlink(deviceList, false);
-        const updateSQL = `Update IrrigationScheduleTempTable set ExecutionStatus =  'DONE'  where ID = ${row.TempTableID}`;
-        console.log(updateSQL);
-        await sql.query(updateSQL);
-    }, timerTarget * 60 * 1000);
+async function checkCompletion(row, deviceList) {
 
+    let completed = false;
+    if (row.target != null && row.TargetType == 'V') {
+        console.log('VVV');
+        let currentWaterflow = await getWaterflowData(deviceList);
+        if (currentWaterflow > row.target) {
+            completed = true;
+        }
+    }
+    else {
+        console.log('TTTT');
+        let diff = (new Date() - row.ExecutionStartTime) / (1000 * 60);
+        console.log('Diff: ' + diff);
+        if (diff > row.target) {
+            completed = true;
+        }
+    }
+    return completed;
 }
 
-
-async function executeDownlink(devices, switchON) {
+async function executeDownlink(deviceList, switchON) {
     console.log("switchON", switchON);
-    const downlinkURL = process.env.DOWNLINK_URL;
-    const downlinkBearer = process.env.BEARER_TOKEN;
+    var downlinkURL = process.env.DOWNLINK_URL;
+    const downlinkBearer1 = process.env.BEARER_TOKEN1;
+    const downlinkBearer2 = process.env.BEARER_TOKEN2;
     const downlinkPayloadOn = 'AwER';
     const downlinkPayloadOff = 'AwAR';
 
-    let devicesArray = devices.split(',');
-    const header = {
+
+    let devices = '';
+    devices = deviceList;
+    let devicesArray = devices.toString().split(',');
+    console.log('deviceList: ' + deviceList);
+    console.dir(devicesArray);
+    let header = {
         "Content-Type": "application/json",
-        "Authorization": "Bearer " + downlinkBearer
+        "Authorization": "Bearer " + downlinkBearer1
     };
 
-    const instance = axios.create({
-        baseURL: downlinkURL,
-        timeout: 2500,
-        headers: header
-    });
-    // Strin
-    devicesArray.forEach(device => {
-        postData = {
-            "downlinks": [
-                {
-                    "frm_payload": switchON ? downlinkPayloadOn : downlinkPayloadOff,
-                    "f_port": 1,
-                    "priority": "NORMAL"
+
+    // String
+    try {
+        if (devicesArray.length > 0) {
+            for (let i = 0; i < devicesArray.length; i++) {
+                downlinkURL = `https://cultyvate.eu1.cloud.thethings.industries/api/v3/as/applications/99808/devices/eui-a840416c318379da/down/replace`;
+
+                postData = {
+                    "downlinks": [
+                        {
+                            "frm_payload": switchON ? downlinkPayloadOn : downlinkPayloadOff,
+                            "f_port": 1,
+                            "priority": "NORMAL"
+                        }
+                    ]
+                };
+
+                if (devicesArray[i] == "a84041182182460a") {
+                    downlinkURL = `https://cultyvate.eu1.cloud.thethings.industries/api/v3/as/applications/ib-testing-v3/devices/a84041182182460a/down/replace`;
+
+                    header = {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + downlinkBearer2
+                    };
+
+                    postData = {
+                        "downlinks": [
+                            {
+                                "frm_payload": switchON ? 'AAI' : 'AAE',
+                                "f_port": 1,
+                                "priority": "NORMAL"
+                            }
+                        ]
+                    };
+
                 }
-            ]
-        };
 
-        route = '/$deviceID/down/replace';
+                let instance = await axios.create({
+                    timeout: 2500,
+                    headers: header
+                });
 
-        instance.post('/eui-a840416c318379da/down/replace').then(function (response) {
-            console.log('success');
-            if (response.statusCode === 200) {
+                let response = await instance.post(downlinkURL, postData);
                 console.log('success');
-                return true;
-            } else {
-                console.log('failed');
-                return false;
+                if (response.status === 200) {
+                    console.log('success', response.statusCode);
+                } else {
+                    console.log('failed');
+                    console.dir(response);
+                    return false;
+                }
             }
-        })
-            .catch(err => console.log('fail', err));
+            return true;
 
-    });
+        } else {
+            return false;
+        }
+    } catch (err) {
+        console.log('fail service', err);
+        return false;
+    }
 }
 
-async function getDeviceList(blocks) {
-
+async function getDeviceList(blocks, sqlDevices) {
     try {
+        console.log('ENTER', blocks);
         await sql.connect(config.sqlConfig);
         let deviceList = '';
-        blockArray = blocks.split(",");
-        blockArray.map(async (blockID) => {
-            let blockInt = parseInt(blockID);
-            blockDevicesSQL = `Select * from FarmerDeviceDetails a join DeviceType b on a.DeviceTypeID = b.ID where FarmerSectionDetailsID = ${blockInt} and FarmerSectionType = 'BO'`;
+        let sqlDeviceList = '';
+        let blockArray = blocks.split(",");
+        console.dir(blockArray);
+
+        for (let i = 0; i < blockArray.length; i++) {
+            blockDevicesSQL = `Select * from FarmerDeviceDetails a join DeviceType b on a.DeviceTypeID = b.ID where FarmerSectionDetailsID = '${blockArray[i]}' and FarmerSectionType = 'BO'`;
+            console.log(blockDevicesSQL);
             let result = await sql.query(blockDevicesSQL);
 
             if (result.recordset.length > 0) {
                 result.recordset.map(row => {
                     if (row.fType == 'FCM' || row.fType == 'FCW') {
+                        console.log('Block Device: ' + row.fType + row.DeviceEUIID);
                         if (deviceList == '') {
                             deviceList = row.DeviceEUIID;
+                            sqlDeviceList = `'` + row.DeviceEUIID + `'`;
                         }
                         else {
                             deviceList += ',' + row.DeviceEUIID;
+                            sqlDeviceList += `,'` + row.DeviceEUIID + `'`;
                         }
                     }
                 });
 
             }
+        }
 
-            plotDevicesSQL = `Select * from FarmerPlotDetails a join FarmerDeviceDetails b on a.ID = b.FarmerSectionDetailsID where FarmerBlockDetailsID = ${blockInt} and FarmerSectionType = 'PO'`;
-            let plotResult = await sql.query(blockDevicesSQL);
 
+        console.dir(blockArray);
+
+        for (var i = 0; i < blockArray.length; i++) {
+
+            plotDevicesSQL = `Select * from FarmerPlotsDetails a join FarmerDeviceDetails b on a.ID = b.FarmerSectionDetailsID join DeviceType c on b.DeviceTypeID = c.ID where FarmerBlockDetailsID = '${blockArray[i]}' and FarmerSectionType = 'PO'`;
+            console.log(plotDevicesSQL);
+            let plotResult = await sql.query(plotDevicesSQL);
             if (plotResult.recordset.length > 0) {
-                plotResult.recordset.map(row => {
-                    if (row.fType == 'FCM' || row.fType == 'FCW') {
+                for (let j = 0; j < plotResult.recordset.length; j++) {
+                    console.log('PLOT Device: ' + plotResult.recordset[j].fType + plotResult.recordset[j].DeviceEUIID);
+                    if (plotResult.recordset[j].fType == 'FCM' || plotResult.recordset[j].fType == 'FCW') {
+                        console.log('FCM Device: ' + plotResult.recordset[j].fType + plotResult.recordset[j].DeviceEUIID);
+
                         if (deviceList == '') {
-                            deviceList = row.DeviceEUIID;
+                            deviceList = plotResult.recordset[j].DeviceEUIID;
+                            sqlDeviceList = `'` + plotResult.recordset[j].DeviceEUIID + `'`;
                         }
                         else {
-                            deviceList += ',' + row.DeviceEUIID;
+                            deviceList += ',' + plotResult.recordset[j].DeviceEUIID;
+                            sqlDeviceList += `,'` + plotResult.recordset[j].DeviceEUIID + `'`;
                         }
                     }
-                });
+                }
             }
 
+        }
 
-        });
-
-        return deviceList;
-
-
+        console.log("deviceList:::::", deviceList);
+        if (sqlDevices) {
+            return sqlDeviceList;
+        } else {
+            return deviceList;
+        }
     } catch (err) {
-        console.log('fail');
+        console.log('fail list');
         console.dir(err);
-        return false;
+        return '';
     }
-
-
 }
 
-async function getWaterflowData(deviceList) {
 
+async function getWaterflowData(deviceList) {
     try {
         telematicQuery = `Select Sum(WaterflowTickLiters) * 30 / 7.5 WaterFlow from Telematics where DeviceID IN (${deviceList}) and cast(SensorDataPacketDateTime as Date) = cast(GetDate() as Date)`
+        await sql.connect(config.sqlConfig);
         let result = await sql.query(telematicQuery);
         return result.recordset[0].WaterFlow;
 
@@ -233,15 +307,12 @@ async function getWaterflowData(deviceList) {
     }
 }
 
+function sqlDateFormat(tickDateTime) {
+    tickyear = '' + tickDateTime.getFullYear();
+    tickMonth = '' + (tickDateTime.getMonth() + 1);
+    tickDate = '' + tickDateTime.getDate();
+    if (tickMonth.length == 1) tickMonth = '0' + tickMonth;
+    if (tickDate.length == 1) tickDate = '0' + tickDate;
+    return tickyear + tickMonth + tickDate;
 
-/////
-
-// function format(tickDateTime) {
-//     tickyear = '' + tickDateTime.getFullYear();
-//     tickMonth = '' + (tickDateTime.getMonth() + 1);
-//     tickDate = '' + tickDateTime.getDate();
-//     if (tickMonth.length == 1) tickMonth = '0' + tickMonth;
-//     if (tickDate.length == 1) tickDate = '0' + tickDate;
-//     return tickyear + tickMonth + tickDate;
-
-// }
+}
