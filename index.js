@@ -5,6 +5,7 @@ require('./config/db.config');
 var logger = require('logger').createLogger('batch.log');
 const config = require('./config/db.config');
 const axios = require('axios');
+var moment = require('moment-timezone');
 
 require('dotenv').config();
 require('axios').default;
@@ -18,7 +19,16 @@ setInterval(stopSchedule, 5000);
 async function initializeSchedule() {
     // console.log('Starting batch.log');
     try {
-        const scheduleQuery = `Select * from FarmerBlockSchedule a where Convert(INT, Replace(Convert(VARCHAR(8),ScheduleTime,108),':','')) < Convert(INT, Replace(Convert(VARCHAR(8),GetDate(),108),':',''))  and ID NOT IN (Select ScheduleID from IrrigationScheduleTempTable where ScheduleID = a.ID and cast(ExecutionDate AS Date) = cast(getDate() As Date)) and ScheduleActiveYN = 1 and DeleteYN != 1`;
+        const indiaTimeZone = 'Asia/Kolkata';
+        const timeUTC = new Date();
+        var localDate = moment(timeUTC).tz(indiaTimeZone).format(); // .toDate();
+        console.log(localDate);
+        let executionDate = localDate.substring(0, 10);
+        console.log(localDate, executionDate);
+
+        const localTimeInt = parseInt((localDate.substring(11, 13) + localDate.substring(14, 16) + '00'));
+        console.log(localTimeInt);
+        const scheduleQuery = `Select * from FarmerBlockSchedule a where Convert(INT, Replace(Convert(VARCHAR(8),ScheduleTime,108),':','')) < ${localTimeInt}  and ID NOT IN (Select ScheduleID from IrrigationScheduleTempTable where ScheduleID = a.ID and cast(ExecutionDate AS Date) = '${executionDate}') and ScheduleActiveYN = 1 and DeleteYN != 1`;
         //console.log(scheduleQuery);
         await sql.connect(config.sqlConfig);
         let result = await sql.query(scheduleQuery);
