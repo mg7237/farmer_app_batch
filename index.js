@@ -28,8 +28,9 @@ async function initializeSchedule() {
 
         const localTimeInt = parseInt((localDate.substring(11, 13) + localDate.substring(14, 16) + '00'));
         console.log(localTimeInt);
+
         const scheduleQuery = `Select * from FarmerBlockSchedule a where Convert(INT, Replace(Convert(VARCHAR(8),ScheduleTime,108),':','')) < ${localTimeInt}  and ID NOT IN (Select ScheduleID from IrrigationScheduleTempTable where ScheduleID = a.ID and cast(ExecutionDate AS Date) = '${executionDate}') and ScheduleActiveYN = 1 and DeleteYN != 1`;
-        //console.log(scheduleQuery);
+        console.log(scheduleQuery);
         await sql.connect(config.sqlConfig);
         let result = await sql.query(scheduleQuery);
         // console.dir(result);
@@ -66,8 +67,10 @@ async function initializeSchedule() {
                         sql.query(`Update FarmerBlockSchedule Set ScheduleActiveYN = 0, DeleteYN = 1 Where ID = ${row.ID}`);
                     }
                 }
-                const insertSQL = `INSERT INTO IrrigationScheduleTempTable (ScheduleID, ExecutionStartTime, ExecutionStatus, ExecutionDate, Target, TargetType, FarmerBlockLinkedIDs ) Values (${row.ID}, GetDate(), '${executionStatus}', cast (GetDate() as Date), ${row.ScheduleIrrigationValue}, '${row.ScheduleIrrigationType}', '${row.FarmerBlockLinkedIDs}')`;
-                //console.log(insertSQL);
+                let executionDate = localDate.substring(0, 10);
+                console.log(executionDate);
+                const insertSQL = `INSERT INTO IrrigationScheduleTempTable (ScheduleID, ExecutionStartTime, ExecutionStatus, ExecutionDate, Target, TargetType, FarmerBlockLinkedIDs ) Values (${row.ID}, '${executionDate}', '${executionStatus}', cast (GetDate() as Date), ${row.ScheduleIrrigationValue}, '${row.ScheduleIrrigationType}', '${row.FarmerBlockLinkedIDs}')`;
+                console.log(insertSQL);
                 await sql.connect(config.sqlConfig);
                 let insertResult = await sql.query(insertSQL);
                 //console.dir(insertResult);
